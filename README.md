@@ -76,7 +76,7 @@ Edge over always long, with 90% intervals from a block bootstrap that resamples 
 
 The edge changes sign across these settings, so whether the model beats always long depends on evaluation choices rather than on the data. The win rate stays between 50.4% and 52.0% in every setting, below always long's 53.7%.
 
-Figures in this section were cross-checked against Zentara's internal Evaluation Integrity Toolkit.
+Figures in this section were cross-checked against Zentara Scientific Solutions' internal Evaluation Integrity Toolkit.
 
 **Reading the results**
 
