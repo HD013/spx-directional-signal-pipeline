@@ -1,0 +1,10 @@
+data/
+outputs/backtest_results.csv
+outputs/*.html
+outputs/*.pdf
+__pycache__/
+*.pyc
+.DS_Store
+*.7z
+.Rhistory
+.idea/
