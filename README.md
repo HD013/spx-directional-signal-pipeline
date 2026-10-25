@@ -9,7 +9,8 @@ The financial dataset serves as a time-dependent prediction testbed. The pipelin
 ## What this demonstrates
 
 - **Temporal validation without leakage.** Expanding-window walk-forward evaluation with a purge at the label horizon. Features use only data available at prediction time.
-- **Honest benchmarking.** Every result is reported next to an always-long baseline evaluated on the same days.
+- **Honest benchmarking.** Every result is reported next to always-long and persistence baselines evaluated on the same days.
+- **Uncertainty and robustness.** Month-block bootstrap intervals on the edge over the baseline, episode counts per regime, cost breakevens, a decay check, and a sweep over the evaluation's own settings.
 - **Calibration and regime analysis.** Reliability of predicted probabilities, and performance by volatility regime with sample sizes.
 - **Tested evaluation code.** A synthetic-data test suite checks fold boundaries, feature causality and determinism, and confirms that the pipeline recovers a planted signal and finds nothing when no signal exists.
 - **Modular, importable code.** Ingest, features, model and backtest are plain functions with no notebook-only logic.
@@ -32,14 +33,14 @@ The financial dataset serves as a time-dependent prediction testbed. The pipelin
 
 ## Results
 
-Out of sample, 2,961 trading days, 2012–2023, no transaction costs.
+Out of sample, 2,961 trading days, 2012–2023, no transaction costs. Persistence predicts that tomorrow's direction repeats today's.
 
-| Metric | Model | Always long |
-|---|---|---|
-| Win rate | 51.3% | 53.7% |
-| Sharpe (annualised) | 0.80 | 0.71 |
-| Summed daily return | 159.6% | 141.2% |
-| Max drawdown (summed) | -42.9% | -38.3% |
+| Metric | Model | Always long | Persistence |
+|---|---|---|---|
+| Win rate | 51.3% | 53.7% | 48.6% |
+| Sharpe (annualised) | 0.80 | 0.71 | -0.35 |
+| Summed daily return | 159.6% | 141.2% | -70.4% |
+| Max drawdown (summed) | -42.9% | -38.3% | -100.5% |
 
 By VIX regime (VIX proxy = mean ATM call IV at 25–35 DTE):
 
@@ -49,20 +50,52 @@ By VIX regime (VIX proxy = mean ATM call IV at 25–35 DTE):
 | Medium (15–25%) | 915 | 51.9% | 53.7% | 1.04 | 0.69 |
 | High (> 25%) | 173 | 55.5% | 53.8% | 2.28 | 1.66 |
 
+### Statistical checks
+
+Edge over always long, with 90% intervals from a block bootstrap that resamples whole calendar months. An episode is a run of consecutive months.
+
+| | Return edge per year | Win-rate gap | Months | Episodes |
+|---|---|---|---|---|
+| Overall | +1.6% [-6.9%, +10.0%] | -2.4% [-4.4%, -0.3%] | 143 | 1 |
+| Low VIX | -4.3% [-12.4%, +3.9%] | -3.4% [-6.0%, -0.6%] | 113 | 7 |
+| Medium VIX | +6.8% [-14.0%, +29.1%] | -1.7% [-5.5%, +1.8%] | 92 | 21 |
+| High VIX | +26.0% [-31.6%, +68.8%] | +1.7% [-7.0%, +8.7%] | 27 | 9 |
+
+- **Costs.** The model trades 0.73 units of position per day on average (a long-to-short flip is 2 units). Its return falls to zero at a cost of 7.4 bps per unit traded, and its advantage over always long disappears at 0.9 bps.
+- **Calibration.** Of the Brier score's uncertainty component (0.2486), the model resolves 0.0005. The calibration slope is 0.045 to 0.054 across six binnings, where 1.0 means calibrated. The observed up-rate stays between 49% and 57% in every probability bin.
+- **Decay.** The win rate is 52.4% over the first 23 folds and 50.2% over the last 24, a difference of -2.3% with a standard error of 1.8%, so no fade is distinguishable from noise.
+
+**Sensitivity to evaluation settings.** Return edge over always long per year, with win rate in brackets, re-run at four purge lengths and scored at three decision thresholds:
+
+| Purge (days) | Threshold 0.45 | 0.50 | 0.55 |
+|---|---|---|---|
+| 0 | -0.2% (51.9%) | +1.1% (51.1%) | -0.5% (50.9%) |
+| 1 | +1.0% (52.0%) | +1.6% (51.3%) | -3.0% (50.4%) |
+| 2 | -1.8% (51.0%) | +0.2% (51.4%) | -0.4% (51.1%) |
+| 5 | +4.7% (51.6%) | +4.5% (51.3%) | +3.1% (50.7%) |
+
+The edge changes sign across these settings, so whether the model beats always long depends on evaluation choices rather than on the data. The win rate stays between 50.4% and 52.0% in every setting, below always long's 53.7%.
+
+Figures in this section were cross-checked against Zentara's internal Evaluation Integrity Toolkit.
+
 **Reading the results**
 
-- The model's win rate is below the always-long baseline, while its Sharpe is modestly higher.
-- Relative to the baseline, the model underperforms when volatility is low and outperforms when it is medium or high. The high-VIX figures rest on 173 days, 154 of them in 2020 and 2022, so they reflect two market episodes and are descriptive, not conclusive.
-- Predicted probabilities are poorly calibrated. The observed up-rate stays between 49% and 57% across every probability bin, and the Brier score (0.308) is worse than a constant forecast (0.249). Only the direction of each prediction is used.
-- The signal is weak and sensitive to small changes: adding the 1-day purge (one fewer training row per fold) changed 13% of daily predictions.
+- The model's win rate is below always long, and the interval on the gap excludes zero. Its return edge (+1.6% per year) is not distinguishable from zero.
+- It underperforms always long when volatility is low. The higher medium- and high-VIX figures have intervals that span zero. The high-VIX figures rest on 173 days in 27 months and 9 episodes, with 154 of those days in 2020 and 2022, so they are descriptive, not conclusive.
+- Predicted probabilities carry almost no information (resolution near zero, slope near 0.05), and the Brier score (0.308) is worse than a constant forecast (0.249). Only the direction of each prediction is used.
+- The signal is weak and sensitive to small changes. Adding the 1-day purge (one fewer training row per fold) changed 13% of daily predictions, and the edge changes sign across evaluation settings.
 - 53 out-of-sample days, all in 2012, have no VIX proxy because no liquid ATM option fell in the 25–35 DTE window (expiries were sparser then). They count in the overall figures but not in the regime table, which is why the regime days sum to 2,908.
 
 ## Methodology and assumptions
 
 - **Positions:** long SPX (+1) when the predicted up-probability is at least 0.5, short (−1) otherwise. The threshold is fixed, not learned. A signal formed at day *t*'s close earns the close-to-close return from *t* to *t+1*.
+- **Baselines:** always long holds SPX every day. Persistence goes long if today's close was up and short otherwise.
 - **Sharpe:** mean daily return divided by its standard deviation, times √252. No risk-free rate.
+- **Intervals:** 90% percentile intervals from a block bootstrap over calendar months (2,000 resamples, seed 0), applied to the daily difference between the model and always long. Months are resampled rather than days so that clustered days are not counted as independent evidence.
+- **Costs:** turnover is the absolute change in position each day, counting the first entry. The breakeven is total gross return divided by total turnover, which is exact for a linear cost.
+- **Sensitivity:** one full walk-forward run per purge length. Thresholds are re-scored from the same predictions without retraining.
 - **Returns:** "summed" figures add daily returns without compounding, and max drawdown is measured on the same summed series. `print_summary()` also reports compounded returns.
-- **Costs:** no transaction costs, slippage or financing.
+- **Costs in the headline figures:** none (no transaction costs, slippage or financing). The breakevens above show what costs would do.
 - **Missing data:** missing feature values (such as the VIX proxy gaps above) are passed to LightGBM, which handles them natively. No rows are dropped for missing features; only the final day, which has no next-day target, is excluded.
 - **Feature importance:** chart 4 comes from a model fit on the full sample, for description only. It is never used for evaluation.
 
@@ -82,7 +115,8 @@ The suite runs in seconds on synthetic options-chain data generated in `tests/co
 - **Ingest:** bracketed headers, padded values, malformed rows and the liquidity filter.
 - **Features:** one row per day, target alignment, and that truncating future data changes no earlier feature.
 - **Backtest:** training never reaches the test window, the purge holds, test days are unique and ordered, and runs are deterministic.
-- **Known truth:** with no planted signal the win rate stays near 50%, and with a planted signal the pipeline recovers it and beats the baseline.
+- **Known truth:** with no planted signal the win rate stays near 50%, and with a planted signal the pipeline recovers it, beats the baseline with an interval excluding zero, and keeps a positive edge in every sensitivity setting.
+- **Statistics:** each check can fail as well as pass. Intervals include zero for a null and exclude it for a planted effect; block intervals are wider than row-level ones on clustered data; net return is exactly zero at the breakeven cost; the Brier identity holds exactly; a constant forecast has zero resolution; and a planted fade is detected while a flat series is not.
 
 CI runs the suite on every push.
 
@@ -93,12 +127,14 @@ CI runs the suite on every push.
 │   ├── ingest.py      # Load and validate raw options data
 │   ├── features.py    # Feature engineering (daily collapse)
 │   ├── model.py       # LightGBM classifier: train() and predict()
-│   └── backtest.py    # Walk-forward engine, baseline, calibration, regime breakdown
+│   ├── backtest.py    # Walk-forward engine, baselines, regime breakdown, sensitivity sweep
+│   └── stats.py       # Block bootstrap, episodes, cost breakeven, calibration, decay
 ├── tests/
 │   ├── conftest.py    # Synthetic options-chain generator with optional planted signal
 │   ├── test_ingest.py
 │   ├── test_features.py
-│   └── test_backtest.py
+│   ├── test_backtest.py
+│   └── test_stats.py
 ├── notebooks/
 │   └── analysis.ipynb # End-to-end walkthrough with charts
 ├── outputs/           # Pre-generated charts
@@ -132,7 +168,10 @@ from pipeline.backtest import run, print_summary
 raw = load_all()
 feat = build_features(raw)
 results, metrics = run(feat)
-print_summary(metrics)  # model vs always long, by regime, calibration
+print_summary(metrics)  # baselines, regimes, intervals, costs, calibration, decay
+
+from pipeline.backtest import sensitivity
+table = sensitivity(feat)  # purge lengths x decision thresholds
 ```
 
 ### Train and predict independently

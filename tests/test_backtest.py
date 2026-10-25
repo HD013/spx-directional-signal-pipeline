@@ -82,3 +82,28 @@ def test_summary_has_baseline_and_calibration(null_feat):
 
     # summarize() on the cached form of results reproduces run()'s metrics
     assert bt.summarize(results)["overall"] == metrics["overall"]
+
+
+def test_summary_has_statistical_checks(null_feat):
+    results, metrics = bt.run(null_feat, **WINDOWS)
+
+    assert set(metrics["persistence"]) == {"overall", "by_regime"}
+    sig = metrics["significance"]["overall"]
+    assert sig["n_months"] == results["date"].dt.to_period("M").nunique()
+    assert sig["return_edge_ann"]["lo"] <= sig["return_edge_ann"]["estimate"] <= sig["return_edge_ann"]["hi"]
+    assert metrics["costs"]["turnover_per_day"] > 0
+    assert len(metrics["calibration"]["slopes"]) == 6
+    assert metrics["decay"]["win_rate"]["n_folds"] == results["fold"].nunique()
+
+
+def test_planted_signal_edge_is_significant(planted_feat):
+    _, metrics = bt.run(planted_feat, **WINDOWS)
+    assert metrics["significance"]["overall"]["win_rate_gap"]["lo"] > 0
+    assert metrics["calibration"]["decomposition"]["resolution"] > 0.01
+
+
+def test_sensitivity_covers_every_cell(planted_feat):
+    table = bt.sensitivity(planted_feat, purges=(0, 2), thresholds=(0.45, 0.55), **WINDOWS)
+    assert len(table) == 4
+    assert set(table["purge_days"]) == {0, 2}
+    assert (table["return_edge_ann"] > 0).all()  # a real signal survives every setting

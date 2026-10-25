@@ -6,8 +6,10 @@ Test window     : 63 days  (~1 quarter)
 Step            : 63 days
 Purge           : 1 day (the label horizon)
 
-Every fold is scored against an always-long baseline, and out-of-sample
-probabilities are checked for calibration.
+Every fold is scored against always-long and persistence baselines. The
+summary adds month-block bootstrap intervals on the edge over always-long,
+episode counts per regime, cost breakevens, a calibration decomposition, and
+a first-half vs second-half decay check (see pipeline/stats.py).
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from pipeline import stats
 from pipeline.model import train, predict
 
 _TRAIN_DAYS = 504
@@ -91,7 +94,13 @@ def summarize(results: pd.DataFrame) -> dict:
     dict
         overall, by_regime      : model metrics
         baseline                : always-long metrics, overall and by regime
-        calibration             : Brier score, reference scores, reliability table
+        persistence             : "tomorrow repeats today" metrics, overall and by regime
+        significance            : month-block intervals on the edge over always-long,
+                                  with month and episode counts, overall and by regime
+        costs                   : turnover and breakeven costs in basis points
+        calibration             : Brier score, references, reliability table,
+                                  decomposition, slopes under several binnings
+        decay                   : first-half vs second-half per-fold comparison
         n_no_regime             : OOS days with no VIX proxy (excluded from by_regime)
     """
     regime = _assign_regime(results["vix_proxy"])
@@ -106,6 +115,43 @@ def summarize(results: pd.DataFrame) -> dict:
     model = _block(results["daily_pnl"], results["correct"])
     baseline = _block(results["fwd_return"], actual_up)
 
+    # Persistence: predict that tomorrow's direction repeats today's
+    persist_pred = (results["ret_today"].fillna(0) > 0).astype(int)
+    persistence = _block((2 * persist_pred - 1) * results["fwd_return"],
+                         persist_pred == results["actual"])
+
+    # Edge over always-long, per day: return difference and win/loss difference
+    months = stats.month_block(results["date"])
+    edge_ret = results["daily_pnl"] - results["fwd_return"]
+    edge_win = results["correct"].astype(float) - actual_up.astype(float)
+
+    def _significance(mask: pd.Series) -> dict | None:
+        if months[mask].nunique() < 2:
+            return None
+        ret = stats.block_bootstrap_mean(edge_ret[mask], months[mask])
+        win = stats.block_bootstrap_mean(edge_win[mask], months[mask])
+        return {
+            "return_edge_ann": {k: ret[k] * 252 for k in ("estimate", "lo", "hi")},
+            "win_rate_gap": {k: win[k] for k in ("estimate", "lo", "hi")},
+            "n_months": ret["n_blocks"],
+            "n_episodes": stats.episodes(months[mask]),
+            "thin": ret["thin"],
+        }
+
+    significance = {
+        "overall": _significance(pd.Series(True, index=results.index)),
+        "by_regime": {r: _significance(regime == r) for r in _REGIMES},
+    }
+
+    position = 2 * results["predicted"] - 1
+    trade = stats.turnover_and_breakeven(position, results["fwd_return"])
+    costs = {
+        "turnover_per_day": trade["turnover_per_row"],
+        "breakeven_bps": trade["breakeven"] * 1e4,
+        "breakeven_vs_long_bps": stats.relative_breakeven(
+            position, np.ones(len(position)), results["fwd_return"]) * 1e4,
+    }
+
     up_rate = actual_up.mean()
     calibration = {
         "brier": ((results["pred_prob"] - results["actual"]) ** 2).mean(),
@@ -113,13 +159,27 @@ def summarize(results: pd.DataFrame) -> dict:
         # Constant forecast at the realised OOS up-rate (a hindsight reference)
         "brier_base_rate": up_rate * (1 - up_rate),
         "table": calibration_table(results),
+        "decomposition": stats.brier_decomposition(results["actual"], results["pred_prob"]),
+        "slopes": stats.calibration_slopes(results["actual"], results["pred_prob"]),
+    }
+
+    per_fold = pd.DataFrame({"fold": results["fold"], "win": results["correct"].astype(float),
+                             "edge": edge_ret}).groupby("fold").mean()
+    edge_decay = stats.decay(per_fold["edge"])
+    decay = {
+        "win_rate": stats.decay(per_fold["win"]),
+        "return_edge_ann": {k: (v * 252 if k != "n_folds" else v) for k, v in edge_decay.items()},
     }
 
     return {
         "overall": model["overall"],
         "by_regime": model["by_regime"],
         "baseline": baseline,
+        "persistence": persistence,
+        "significance": significance,
+        "costs": costs,
         "calibration": calibration,
+        "decay": decay,
         "n_no_regime": int(regime.isna().sum()),
     }
 
@@ -153,8 +213,8 @@ def run(
     Returns
     -------
     results : pd.DataFrame
-        One row per test day: date, pred_prob, predicted, actual, correct,
-        vix_proxy, fwd_return, daily_pnl, cumulative_pnl, vix_regime.
+        One row per test day: date, fold, pred_prob, predicted, actual, correct,
+        vix_proxy, ret_today, fwd_return, daily_pnl, cumulative_pnl, vix_regime.
     metrics : dict
         Output of summarize(results).
     """
@@ -187,11 +247,13 @@ def run(
         fold_df = pd.DataFrame(
             {
                 "date": test_slice["date"].values,
+                "fold": fold_num,
                 "pred_prob": preds.values,
                 "predicted": predicted,
                 "actual": actual,
                 "correct": predicted == actual,
                 "vix_proxy": test_slice["vix_proxy"].values,
+                "ret_today": test_slice["underlying_return_1d"].values,
                 "fwd_return": fwd_ret,
                 "daily_pnl": signal * fwd_ret,
             }
@@ -212,34 +274,106 @@ def run(
     return results, summarize(results)
 
 
-def _print_block(title: str, m: dict, b: dict) -> None:
-    """Print one model-vs-baseline block."""
-    print(f"\n{title}  n={m['n_days']}")
-    print(f"  {'':14s}{'model':>10s}{'always long':>14s}")
-    print(f"  {'Win rate':14s}{m['win_rate']:>10.1%}{b['win_rate']:>14.1%}")
-    print(f"  {'Sharpe':14s}{m['sharpe']:>10.2f}{b['sharpe']:>14.2f}")
-    print(f"  {'Max drawdown':14s}{m['max_drawdown']:>10.1%}{b['max_drawdown']:>14.1%}")
-    print(f"  {'Summed return':14s}{m['total_return']:>10.1%}{b['total_return']:>14.1%}")
-    print(f"  {'Compounded':14s}{m['compounded_return']:>10.1%}{b['compounded_return']:>14.1%}")
+def sensitivity(
+    features_df: pd.DataFrame,
+    purges=(0, 1, 2, 5),
+    thresholds=(0.45, 0.50, 0.55),
+    **run_kw,
+) -> pd.DataFrame:
+    """
+    Re-run the walk-forward under alternative evaluation settings.
+
+    One full run() per purge length; each decision threshold is re-scored from
+    that run's pred_prob without retraining. Returns one row per (purge,
+    threshold) with win rate, Sharpe, and the annualised return edge over
+    always-long. If the edge changes sign across rows, the conclusion depends
+    on the evaluation settings rather than on the data.
+    """
+    run_kw.setdefault("verbose", False)
+    rows = []
+    for purge in purges:
+        results, _ = run(features_df, purge_days=purge, **run_kw)
+        for th in thresholds:
+            pred = (results["pred_prob"] >= th).astype(int)
+            pnl = (2 * pred - 1) * results["fwd_return"]
+            m = _metrics(pnl, pred == results["actual"])
+            rows.append({
+                "purge_days": purge,
+                "threshold": th,
+                "win_rate": m["win_rate"],
+                "sharpe": m["sharpe"],
+                "return_edge_ann": (pnl - results["fwd_return"]).mean() * 252,
+            })
+    return pd.DataFrame(rows)
+
+
+def _print_block(title: str, columns: dict) -> None:
+    """Print one block of metrics, one column per strategy."""
+    names = list(columns)
+    print(f"\n{title}  n={columns[names[0]]['n_days']}")
+    print(f"  {'':14s}" + "".join(f"{n:>14s}" for n in names))
+    for label, key, fmt in [
+        ("Win rate", "win_rate", "{:>14.1%}"),
+        ("Sharpe", "sharpe", "{:>14.2f}"),
+        ("Max drawdown", "max_drawdown", "{:>14.1%}"),
+        ("Summed return", "total_return", "{:>14.1%}"),
+        ("Compounded", "compounded_return", "{:>14.1%}"),
+    ]:
+        print(f"  {label:14s}" + "".join(fmt.format(columns[n][key]) for n in names))
+
+
+def _fmt_interval(d: dict, fmt: str) -> str:
+    return f"{fmt.format(d['estimate'])} [{fmt.format(d['lo'])}, {fmt.format(d['hi'])}]"
 
 
 def print_summary(metrics: dict) -> None:
     """Print a formatted performance summary."""
-    base = metrics["baseline"]
-    _print_block("=== Overall ===", metrics["overall"], base["overall"])
+    base, pers = metrics["baseline"], metrics["persistence"]
+
+    def _cols(m, b, p):
+        return {"model": m, "always long": b, "persistence": p}
+
+    _print_block("=== Overall ===", _cols(metrics["overall"], base["overall"], pers["overall"]))
 
     print("\n=== By VIX Regime ===")
     for regime, m in metrics["by_regime"].items():
         if not m or m["n_days"] == 0:
             continue
-        _print_block(f"[{regime.upper()} VIX]", m, base["by_regime"][regime])
+        _print_block(f"[{regime.upper()} VIX]",
+                     _cols(m, base["by_regime"][regime], pers["by_regime"][regime]))
     print(f"\n  Days with no VIX proxy (excluded above): {metrics['n_no_regime']}")
 
+    print("\n=== Edge over always long (90% month-block intervals) ===")
+    sig = metrics["significance"]
+    for name, s in [("overall", sig["overall"])] + list(sig["by_regime"].items()):
+        if s is None:
+            continue
+        print(f"  {name:8s} return {_fmt_interval(s['return_edge_ann'], '{:+.1%}')}/yr   "
+              f"win rate {_fmt_interval(s['win_rate_gap'], '{:+.1%}')}   "
+              f"{s['n_months']} months, {s['n_episodes']} episode(s)")
+
+    c = metrics["costs"]
+    print("\n=== Costs ===")
+    print(f"  Turnover per day                 : {c['turnover_per_day']:.2f}")
+    print(f"  Breakeven cost                   : {c['breakeven_bps']:.1f} bps per unit traded")
+    print(f"  Breakeven vs always long         : {c['breakeven_vs_long_bps']:.1f} bps per unit traded")
+
     cal = metrics["calibration"]
+    d = cal["decomposition"]
     print("\n=== Calibration ===")
     print(f"  Brier score            : {cal['brier']:.4f}")
     print(f"  Coin flip (0.5)        : {cal['brier_coin_flip']:.4f}")
     print(f"  Constant at OOS up-rate: {cal['brier_base_rate']:.4f}")
+    print(f"  Reliability / resolution / uncertainty: "
+          f"{d['reliability']:.4f} / {d['resolution']:.4f} / {d['uncertainty']:.4f}")
+    s = cal["slopes"]["slope"]
+    print(f"  Calibration slope (6 binnings): {s.min():.3f} to {s.max():.3f}  (1.0 = calibrated)")
+
+    print("\n=== Decay (first half vs second half of folds) ===")
+    for name, fmt in [("win_rate", "{:.1%}"), ("return_edge_ann", "{:+.1%}")]:
+        x = metrics["decay"][name]
+        print(f"  {name:16s}: {fmt.format(x['first_half'])} -> {fmt.format(x['second_half'])}  "
+              f"(difference {fmt.format(x['difference'])}, se {fmt.format(x['se'])})")
 
 
 if __name__ == "__main__":
